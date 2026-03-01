@@ -122,7 +122,7 @@ pub fn audit_zip_bytes(bytes: &[u8]) -> Result<SkillAuditReport> {
     use std::io::Read as _;
 
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor).context("not a valid zip archive")?;
+    let mut archive = ZipArchive::new(cursor).context("not a valid zip archive")?;
 
     let entry_count = archive.len();
     if entry_count > ZIP_MAX_ENTRIES {

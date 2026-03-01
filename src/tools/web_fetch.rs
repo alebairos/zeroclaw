@@ -125,28 +125,12 @@ impl WebFetchTool {
     fn convert_html_to_output(&self, body: &str) -> anyhow::Result<String> {
         match self.provider.as_str() {
             "fast_html2md" => {
-                #[cfg(feature = "web-fetch-html2md")]
-                {
-                    Ok(html2md::rewrite_html(body, false))
-                }
-                #[cfg(not(feature = "web-fetch-html2md"))]
-                {
-                    anyhow::bail!(
-                        "web_fetch provider 'fast_html2md' requires Cargo feature 'web-fetch-html2md'"
-                    );
-                }
+                anyhow::bail!(
+                    "web_fetch provider 'fast_html2md' is currently disabled"
+                );
             }
             "nanohtml2text" => {
-                #[cfg(feature = "web-fetch-plaintext")]
-                {
-                    Ok(nanohtml2text::html2text(body))
-                }
-                #[cfg(not(feature = "web-fetch-plaintext"))]
-                {
-                    anyhow::bail!(
-                        "web_fetch provider 'nanohtml2text' requires Cargo feature 'web-fetch-plaintext'"
-                    );
-                }
+                Ok(nanohtml2text::html2text(body))
             }
             _ => anyhow::bail!(
                 "Unknown web_fetch provider: '{}'. Set [web_fetch].provider to 'fast_html2md', 'nanohtml2text', 'firecrawl', or 'tavily' in config.toml",
@@ -221,84 +205,8 @@ impl WebFetchTool {
         )
     }
 
-    #[cfg(feature = "firecrawl")]
-    async fn fetch_with_firecrawl(&self, url: &str) -> anyhow::Result<String> {
-        let auth_token = self.get_next_api_key().ok_or_else(|| {
-            anyhow::anyhow!(
-                "web_fetch provider 'firecrawl' requires [web_fetch].api_key in config.toml"
-            )
-        })?;
-
-        let api_url = self
-            .api_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("https://api.firecrawl.dev");
-        let endpoint = format!("{}/v1/scrape", api_url.trim_end_matches('/'));
-
-        let response = self
-            .build_http_client()?
-            .post(endpoint)
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", auth_token),
-            )
-            .json(&json!({
-                "url": url,
-                "formats": ["markdown"],
-                "onlyMainContent": true,
-                "timeout": (self.effective_timeout_secs() * 1000) as u64
-            }))
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            anyhow::bail!(
-                "Firecrawl scrape failed with status {}: {}",
-                status.as_u16(),
-                body
-            );
-        }
-
-        let parsed: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("Invalid Firecrawl response JSON: {e}"))?;
-        if !parsed
-            .get("success")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            let error = parsed
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown error");
-            anyhow::bail!("Firecrawl scrape failed: {error}");
-        }
-
-        let data = parsed
-            .get("data")
-            .ok_or_else(|| anyhow::anyhow!("Firecrawl response missing data field"))?;
-        let output = data
-            .get("markdown")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| data.get("html").and_then(serde_json::Value::as_str))
-            .or_else(|| data.get("rawHtml").and_then(serde_json::Value::as_str))
-            .unwrap_or("")
-            .to_string();
-
-        if output.trim().is_empty() {
-            anyhow::bail!("Firecrawl returned empty content");
-        }
-
-        Ok(output)
-    }
-
-    #[cfg(not(feature = "firecrawl"))]
-    #[allow(clippy::unused_async)]
     async fn fetch_with_firecrawl(&self, _url: &str) -> anyhow::Result<String> {
-        anyhow::bail!("web_fetch provider 'firecrawl' requires Cargo feature 'firecrawl'")
+        anyhow::bail!("web_fetch provider 'firecrawl' is not supported in this version")
     }
 
     async fn fetch_with_tavily(&self, url: &str) -> anyhow::Result<String> {
@@ -503,29 +411,6 @@ mod tests {
         assert!(schema["properties"]["url"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("url")));
-    }
-
-    #[cfg(feature = "web-fetch-html2md")]
-    #[test]
-    fn html_to_markdown_conversion_preserves_structure() {
-        let tool = test_tool(vec!["example.com"]);
-        let html = "<html><body><h1>Title</h1><ul><li>Hello</li></ul></body></html>";
-        let markdown = tool.convert_html_to_output(html).unwrap();
-        assert!(markdown.contains("Title"));
-        assert!(markdown.contains("Hello"));
-        assert!(!markdown.contains("<h1>"));
-    }
-
-    #[cfg(feature = "web-fetch-plaintext")]
-    #[test]
-    fn html_to_plaintext_conversion_removes_html_tags() {
-        let tool =
-            test_tool_with_provider(vec!["example.com"], vec![], "nanohtml2text", None, None);
-        let html = "<html><body><h1>Title</h1><p>Hello <b>world</b></p></body></html>";
-        let text = tool.convert_html_to_output(html).unwrap();
-        assert!(text.contains("Title"));
-        assert!(text.contains("Hello"));
-        assert!(!text.contains("<h1>"));
     }
 
     #[test]
@@ -785,11 +670,7 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         let error = result.error.unwrap_or_default();
-        if cfg!(feature = "firecrawl") {
-            assert!(error.contains("requires [web_fetch].api_key"));
-        } else {
-            assert!(error.contains("requires Cargo feature 'firecrawl'"));
-        }
+        assert!(error.contains("not supported in this version"));
     }
 
     #[tokio::test]

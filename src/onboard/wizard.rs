@@ -3053,8 +3053,6 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         let provider_options = vec![
             "DuckDuckGo (free, no API key)",
             "Brave Search (requires API key)",
-            #[cfg(feature = "firecrawl")]
-            "Firecrawl (requires API key + firecrawl feature)",
         ];
         let provider_choice = Select::new()
             .with_prompt("  web_search provider")
@@ -3070,25 +3068,6 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
                     .interact_text()?;
                 if !key.trim().is_empty() {
                     web_search_config.brave_api_key = Some(key.trim().to_string());
-                }
-            }
-            #[cfg(feature = "firecrawl")]
-            2 => {
-                web_search_config.provider = "firecrawl".to_string();
-                let key: String = Input::new()
-                    .with_prompt("  Firecrawl API key")
-                    .interact_text()?;
-                if !key.trim().is_empty() {
-                    web_search_config.api_key = Some(key.trim().to_string());
-                }
-                let url: String = Input::new()
-                    .with_prompt(
-                        "  Firecrawl API URL (leave blank for cloud https://api.firecrawl.dev)",
-                    )
-                    .allow_empty(true)
-                    .interact_text()?;
-                if !url.trim().is_empty() {
-                    web_search_config.api_url = Some(url.trim().to_string());
                 }
             }
             _ => {
@@ -3124,8 +3103,6 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         let provider_options = vec![
             "fast_html2md (local HTML-to-Markdown, default)",
             "nanohtml2text (local HTML-to-plaintext, lighter)",
-            #[cfg(feature = "firecrawl")]
-            "firecrawl (cloud conversion, requires API key)",
         ];
         let provider_choice = Select::new()
             .with_prompt("  web_fetch provider")
@@ -3136,25 +3113,6 @@ fn setup_web_tools() -> Result<(WebSearchConfig, WebFetchConfig, HttpRequestConf
         match provider_choice {
             1 => {
                 web_fetch_config.provider = "nanohtml2text".to_string();
-            }
-            #[cfg(feature = "firecrawl")]
-            2 => {
-                web_fetch_config.provider = "firecrawl".to_string();
-                let key: String = Input::new()
-                    .with_prompt("  Firecrawl API key")
-                    .interact_text()?;
-                if !key.trim().is_empty() {
-                    web_fetch_config.api_key = Some(key.trim().to_string());
-                }
-                let url: String = Input::new()
-                    .with_prompt(
-                        "  Firecrawl API URL (leave blank for cloud https://api.firecrawl.dev)",
-                    )
-                    .allow_empty(true)
-                    .interact_text()?;
-                if !url.trim().is_empty() {
-                    web_fetch_config.api_url = Some(url.trim().to_string());
-                }
             }
             _ => {
                 web_fetch_config.provider = "fast_html2md".to_string();

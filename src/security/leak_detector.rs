@@ -307,7 +307,7 @@ impl LeakDetector {
         patterns: &mut Vec<String>,
         redacted: &mut String,
     ) {
-        let threshold = (HIGH_ENTROPY_BASELINE + (self.sensitivity - 0.5) * 0.6).clamp(3.9, 4.8);
+        let threshold = (HIGH_ENTROPY_BASELINE + (0.5 - self.sensitivity) * 0.6).clamp(3.9, 4.8);
         let mut flagged = false;
 
         for token in extract_candidate_tokens(content) {

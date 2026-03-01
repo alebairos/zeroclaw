@@ -1595,6 +1595,7 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
 // interactive REPL mode. The interactive loop manages history compaction
 // and hard trimming to keep the context window bounded.
 
+/// Backward-compatible entry point: runs the agent with memory from config.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     config: Config,
@@ -1604,6 +1605,32 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
+) -> Result<String> {
+    run_with_memory(
+        config,
+        message,
+        provider_override,
+        model_override,
+        temperature,
+        peripheral_overrides,
+        interactive,
+        None,
+    )
+    .await
+}
+
+/// Run the agent with an optional memory backend. When `memory_override` is `Some`,
+/// that instance is used instead of creating from config (e.g. for embedded use).
+#[allow(clippy::too_many_lines)]
+pub async fn run_with_memory(
+    config: Config,
+    message: Option<String>,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    peripheral_overrides: Vec<String>,
+    interactive: bool,
+    memory_override: Option<std::sync::Arc<dyn Memory>>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -1616,12 +1643,15 @@ pub async fn run(
     ));
 
     // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    let mem: Arc<dyn Memory> = match memory_override {
+        Some(m) => m,
+        None => Arc::from(memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?),
+    };
     tracing::info!(backend = mem.name(), "Memory initialized");
 
     // ── Peripherals (merge peripheral tools into registry) ─
@@ -1879,6 +1909,11 @@ pub async fn run(
             let _ = mem
                 .store(&user_key, &msg, MemoryCategory::Conversation, None)
                 .await;
+            
+            // FT-090: Persist to conversation history
+            let _ = mem
+                .store_conversation("user", &msg, channel_name, "user", None)
+                .await;
         }
 
         // Inject memory + hardware RAG context into user message
@@ -1922,6 +1957,12 @@ pub async fn run(
         )
         .await?;
         final_output = response.clone();
+        
+        // FT-090: Persist assistant response to conversation history
+        let _ = mem
+            .store_conversation("assistant", &final_output, channel_name, "user", None)
+            .await;
+
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
@@ -2007,6 +2048,11 @@ pub async fn run(
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)
                     .await;
+                
+                // FT-090: Persist to conversation history
+                let _ = mem
+                    .store_conversation("user", &user_input, channel_name, "user", None)
+                    .await;
             }
 
             // Inject memory + hardware RAG context into user message
@@ -2064,6 +2110,12 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
+            
+            // FT-090: Persist assistant response to conversation history
+            let _ = mem
+                .store_conversation("assistant", &final_output, channel_name, "user", None)
+                .await;
+
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
                 &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),

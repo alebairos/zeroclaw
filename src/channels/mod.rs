@@ -1660,16 +1660,35 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
-fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+fn append_sender_turn(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+    channel: &str,
+    thread_ts: Option<&str>,
+) {
     let mut histories = ctx
         .conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let turns = histories.entry(sender_key.to_string()).or_default();
-    turns.push(turn);
+    turns.push(turn.clone());
     while turns.len() > MAX_CHANNEL_HISTORY {
         turns.remove(0);
     }
+
+    // FT-090: Persist turn to memory
+    let mem = Arc::clone(&ctx.memory);
+    let role = turn.role.to_string();
+    let content = turn.content.to_string();
+    let sender = sender_key.to_string();
+    let channel = channel.to_string();
+    let thread_ts = thread_ts.map(String::from);
+    tokio::spawn(async move {
+        let _ = mem
+            .store_conversation(&role, &content, &channel, &sender, thread_ts.as_deref())
+            .await;
+    });
 }
 
 fn rollback_orphan_user_turn(
@@ -3102,7 +3121,7 @@ or tune thresholds in config.",
     // Try classification first, fall back to sender/default route
     let route = classify_message_route(ctx.as_ref(), &msg.content)
         .unwrap_or_else(|| get_route_selection(ctx.as_ref(), &history_key));
-    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
         Err(err) => {
@@ -3122,6 +3141,8 @@ or tune thresholds in config.",
             return;
         }
     };
+    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -3135,7 +3156,6 @@ or tune thresholds in config.",
             .await;
     }
 
-    println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
     let had_prior_history = ctx
@@ -3155,6 +3175,8 @@ or tune thresholds in config.",
         ctx.as_ref(),
         &history_key,
         ChatMessage::user(&timestamped_content),
+        &msg.channel,
+        msg.thread_ts.as_deref(),
     );
 
     // Build history from per-sender conversation cache.
@@ -3516,6 +3538,8 @@ or tune thresholds in config.",
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant(&history_response),
+                &msg.channel,
+                msg.thread_ts.as_deref(),
             );
             println!(
                 "  🤖 Reply ({}ms): {}",
@@ -3640,6 +3664,8 @@ or tune thresholds in config.",
                     ChatMessage::assistant(
                         "[Task paused at tool-iteration limit — context preserved. Ask to continue.]",
                     ),
+                    &msg.channel,
+                    msg.thread_ts.as_deref(),
                 );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
@@ -3687,6 +3713,8 @@ or tune thresholds in config.",
                         ctx.as_ref(),
                         &history_key,
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
+                        &msg.channel,
+                        msg.thread_ts.as_deref(),
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
@@ -3734,6 +3762,8 @@ or tune thresholds in config.",
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
+                &msg.channel,
+                msg.thread_ts.as_deref(),
             );
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
@@ -4795,9 +4825,19 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     Ok(())
 }
 
-/// Start all configured channels and route messages to the agent
+/// Backward-compatible entry point: starts channels with memory from config.
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    start_channels_with_memory(config, None).await
+}
+
+/// Start all configured channels with an optional memory backend. When `memory_override` is
+/// `Some`, that instance is used instead of creating from config (e.g. for embedded use).
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_memory(
+    config: Config,
+    memory_override: Option<std::sync::Arc<dyn Memory>>,
+) -> Result<()> {
     // Ensure stale channel handles are never reused across restarts.
     clear_live_channels();
 
@@ -4855,12 +4895,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
     ));
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    let mem: Arc<dyn Memory> = match memory_override {
+        Some(m) => m,
+        None => Arc::from(memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?),
+    };
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -5073,13 +5116,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("🦀 ZeroClaw Channel Server");
     println!("  🤖 Model:    {model}");
-    let effective_backend = memory::effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
     println!(
         "  🧠 Memory:   {} (auto-save: {})",
-        effective_backend,
+        mem.name(),
         if config.memory.auto_save { "on" } else { "off" }
     );
     println!(
@@ -5518,7 +5557,10 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         };
 
@@ -5572,11 +5614,14 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         };
 
-        append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
+        append_sender_turn(&ctx, &sender, ChatMessage::user("hello"), "test", None);
 
         let histories = ctx
             .conversation_histories
@@ -5629,7 +5674,10 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         };
 
@@ -6227,7 +6275,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -6302,7 +6353,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6366,7 +6420,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6442,7 +6499,10 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6519,7 +6579,10 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6592,7 +6655,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -6656,7 +6722,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -6729,7 +6798,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -7440,7 +7512,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
@@ -8118,7 +8193,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -8194,7 +8272,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -8286,7 +8367,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -8431,7 +8515,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -8534,7 +8621,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -8599,7 +8689,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -8776,7 +8869,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -8861,7 +8957,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -8958,7 +9057,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -9037,7 +9139,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -9101,7 +9206,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -9622,7 +9730,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -9712,7 +9823,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -9750,7 +9864,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .get("test-channel_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "hello");
+        assert!(turns[0].content.ends_with("hello"));
         assert!(!turns[0].content.contains("[Memory context]"));
     }
 
@@ -9802,7 +9916,10 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -10506,7 +10623,10 @@ BTC is currently around $65,000 based on latest tool output."#;
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -10577,7 +10697,10 @@ BTC is currently around $65,000 based on latest tool output."#;
             query_classification: crate::config::QueryClassificationConfig::default(),
             model_routes: Vec::new(),
             approval_manager: Arc::new(ApprovalManager::from_config(
-                &crate::config::AutonomyConfig::default(),
+                &crate::config::AutonomyConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..Default::default()
+                },
             )),
         });
 
@@ -10634,7 +10757,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "What is WAL?");
+        assert!(turns[0].content.ends_with("What is WAL?"));
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "ok");
         assert!(

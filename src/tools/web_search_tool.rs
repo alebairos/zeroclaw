@@ -214,104 +214,8 @@ impl WebSearchTool {
         Ok(lines.join("\n"))
     }
 
-    #[cfg(feature = "firecrawl")]
-    async fn search_firecrawl(&self, query: &str) -> anyhow::Result<String> {
-        let auth_token = self.get_next_api_key().ok_or_else(|| {
-            anyhow::anyhow!(
-                "web_search provider 'firecrawl' requires [web_search].api_key in config.toml"
-            )
-        })?;
-
-        let api_url = self
-            .api_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("https://api.firecrawl.dev");
-        let endpoint = format!("{}/v1/search", api_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(self.user_agent.as_str())
-            .build()?;
-
-        let response = client
-            .post(endpoint)
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", auth_token),
-            )
-            .json(&json!({
-                "query": query,
-                "limit": self.max_results,
-                "timeout": (self.timeout_secs * 1000) as u64,
-            }))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Firecrawl search failed: {e}"))?;
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            anyhow::bail!(
-                "Firecrawl search failed with status {}: {}",
-                status.as_u16(),
-                body
-            );
-        }
-
-        let parsed: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("Invalid Firecrawl response JSON: {e}"))?;
-        if !parsed
-            .get("success")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            let error = parsed
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown error");
-            anyhow::bail!("Firecrawl search failed: {error}");
-        }
-
-        let results = parsed
-            .get("data")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("Firecrawl response missing data array"))?;
-
-        if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
-        }
-
-        let mut lines = vec![format!("Search results for: {} (via Firecrawl)", query)];
-
-        for (i, result) in results.iter().take(self.max_results).enumerate() {
-            let title = result
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("No title");
-            let url = result
-                .get("url")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let description = result
-                .get("description")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-
-            lines.push(format!("{}. {}", i + 1, title));
-            lines.push(format!("   {}", url));
-            if !description.trim().is_empty() {
-                lines.push(format!("   {}", description.trim()));
-            }
-        }
-
-        Ok(lines.join("\n"))
-    }
-
-    #[cfg(not(feature = "firecrawl"))]
-    #[allow(clippy::unused_async)]
     async fn search_firecrawl(&self, _query: &str) -> anyhow::Result<String> {
-        anyhow::bail!("web_search provider 'firecrawl' requires Cargo feature 'firecrawl'")
+        anyhow::bail!("web_search provider 'firecrawl' is not supported in this version")
     }
 
     async fn search_tavily(&self, query: &str) -> anyhow::Result<String> {
@@ -697,11 +601,7 @@ mod tests {
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
-        if cfg!(feature = "firecrawl") {
-            assert!(error.contains("api_key"));
-        } else {
-            assert!(error.contains("requires Cargo feature 'firecrawl'"));
-        }
+        assert!(error.contains("not supported in this version"));
     }
 
     #[tokio::test]
