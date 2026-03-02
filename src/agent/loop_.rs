@@ -2629,6 +2629,32 @@ pub async fn run(
     interactive: bool,
     hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<String> {
+    run_with_memory(
+        config,
+        message,
+        provider_override,
+        model_override,
+        temperature,
+        peripheral_overrides,
+        interactive,
+        hooks,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn run_with_memory(
+    config: Config,
+    message: Option<String>,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    peripheral_overrides: Vec<String>,
+    interactive: bool,
+    hooks: Option<&crate::hooks::HookRunner>,
+    memory_override: Option<Arc<dyn Memory>>,
+) -> Result<String> {
     if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
         tracing::warn!("plugin registry initialization skipped: {error}");
     }
@@ -2647,12 +2673,16 @@ pub async fn run(
     ));
 
     // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    let mem: Arc<dyn Memory> = if let Some(mem) = memory_override {
+        mem
+    } else {
+        Arc::from(memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?)
+    };
     tracing::info!(backend = mem.name(), "Memory initialized");
 
     // ── Peripherals (merge peripheral tools into registry) ─
@@ -2927,6 +2957,10 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
+        let _ = mem
+            .store_conversation("user", &msg, channel_name, "user", None)
+            .await;
+
         // Auto-save user message to memory (skip short/trivial messages)
         if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let user_key = autosave_memory_key("user_msg");
@@ -3001,6 +3035,11 @@ pub async fn run(
         )
         .await?;
         final_output = response.clone();
+
+        let _ = mem
+            .store_conversation("assistant", &final_output, channel_name, "user", None)
+            .await;
+
         if config.memory.auto_save && response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let assistant_key = autosave_memory_key("assistant_resp");
             let _ = mem
@@ -3072,6 +3111,11 @@ pub async fn run(
             if user_input.is_empty() {
                 continue;
             }
+
+            let _ = mem
+                .store_conversation("user", &user_input, channel_name, "user", None)
+                .await;
+
             rl.add_history_entry(&input)?;
             match user_input.as_str() {
                 "/quit" | "/exit" => {
@@ -3256,6 +3300,11 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
+
+            let _ = mem
+                .store_conversation("assistant", &final_output, channel_name, "user", None)
+                .await;
+
             if config.memory.auto_save && response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let assistant_key = autosave_memory_key("assistant_resp");
                 let _ = mem

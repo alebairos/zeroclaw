@@ -1874,6 +1874,18 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+    let role = turn.role.clone();
+    let content = turn.content.clone();
+    let channel = sender_key.split(':').next().unwrap_or("").to_string();
+    let sender = sender_key.split(':').nth(1).unwrap_or("").to_string();
+
+    let mem = Arc::clone(&ctx.memory);
+    tokio::spawn(async move {
+        let _ = mem
+            .store_conversation(&role, &content, &channel, &sender, None)
+            .await;
+    });
+
     let mut histories = ctx
         .conversation_histories
         .lock()
@@ -5401,8 +5413,16 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 }
 
 /// Start all configured channels and route messages to the agent
-#[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    start_channels_with_memory(config, None).await
+}
+
+/// Start all configured channels with an optional external memory provider
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_memory(
+    config: Config,
+    memory_override: Option<Arc<dyn Memory>>,
+) -> Result<()> {
     // Ensure stale channel handles are never reused across restarts.
     clear_live_channels();
 
@@ -5473,12 +5493,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
     ));
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    let mem: Arc<dyn Memory> = if let Some(mem) = memory_override {
+        mem
+    } else {
+        Arc::from(memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?)
+    };
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),

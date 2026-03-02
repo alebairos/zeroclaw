@@ -93,6 +93,21 @@ pub trait Memory: Send + Sync {
     /// Health check
     async fn health_check(&self) -> bool;
 
+    /// FT-090: Store a conversation turn (user/assistant/system) with metadata.
+    /// Default implementation falls back to store() with Conversation category.
+    async fn store_conversation(
+        &self,
+        role: &str,
+        content: &str,
+        _channel: &str,
+        _sender: &str,
+        _thread_ts: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let key = format!("conv_{}_{}", role, chrono::Utc::now().timestamp_micros());
+        self.store(&key, content, MemoryCategory::Conversation, None)
+            .await
+    }
+
     /// Rebuild embeddings for all memories using the current embedding provider.
     /// Returns the number of memories reindexed, or an error if not supported.
     ///
