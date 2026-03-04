@@ -3411,12 +3411,7 @@ async fn process_channel_message(
         return;
     }
 
-    println!(
-        "  💬 [{}] from {}: {}",
-        msg.channel,
-        msg.sender,
-        truncate_with_ellipsis(&msg.content, 80)
-    );
+    println!("  💬 [{}] from {}: {}", msg.channel, msg.sender, msg.content);
     runtime_trace::record_event(
         "channel_message_inbound",
         Some(msg.channel.as_str()),
@@ -4066,7 +4061,7 @@ or tune thresholds in config.",
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&delivered_response, 80)
+                delivered_response
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
